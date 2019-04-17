@@ -1,0 +1,663 @@
+/**********
+
+  AOS/VS Dump File Loader (adfl)
+
+  This file is part of adfl.
+
+  adfl is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  adfl is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with adfl.  If not, see <http://www.gnu.org/licenses/>.
+
+  Copyright 2014 Steve Merrony
+
+  Version 1.1 - Jun 2014 - PL/1 port of my C original version
+  Version 1.2 - Dec 2014 - Correctly pad out empty blocks in files
+
+
+********/
+
+adfl: proc( parms ) options( main );
+
+%INCLUDE 'get_working_dir.inc';
+%INCLUDE 'rev_bytes_in_dword.inc';
+%INCLUDE 'swap_bytes_in_word.inc';
+
+%REPLACE true by '1'b;
+%REPLACE false by '0'b;
+
+/* Linux system calls */
+%REPLACE SYS_CHDIR   by 12;
+%REPLACE SYS_MKDIR   by 39;
+%REPLACE SYS_SYMLINK by 83;
+
+dcl syscall entry returns( fixed binary(31) ) options( linkage(system) ) ext( '_pli_Syscall' );
+
+dcl ( addr, index, length, string, substr, translate ) builtin;
+
+%INCLUDE "aosvs_dump_fmt.inc";
+
+  dcl parms char(132) varying;
+
+  dcl sysprint print unbuffered;  
+
+  /* options and parameters passed into the program */
+  dcl (help_flag,
+       ignore_errors_flag,
+       list_flag,
+       summarise_flag,
+       verbose_flag,
+       version_flag,
+       extract_flag) bit(1) init( false );
+  dcl dump_filename  char(132) varying;
+
+  DCL VERSION   pic 'z9V.9' static init( 1.2 ); /* TODO: Update for each release */
+
+  /* rather too many globals... */
+  dcl load_it   bit(1) init( false );
+  dcl file_type char(20) varying;
+  dcl file_name char(128) varying; 
+  dcl directory char(256) varying;
+  dcl run_dir   char(500) varying;
+  dcl dumpfile  file record input environment( U ); 
+  dcl loadedfp  file record output environment( U blksize(MAX_BLOCK_SIZE) recsize(MAX_BLOCK_SIZE) );
+  dcl accum_total_file_size bit init( false );
+  dcl total_file_byte_size  fixed binary(31) init( 0 );
+  dcl in_file_blocks        bit init( false );
+
+  on error snap;
+  
+  if length( parms ) = 0 then do;
+    call show_usage;
+    return;
+  end;
+
+  dump_filename = parse_parms( parms );
+
+  if length( dump_filename ) = 0 then call show_usage;
+
+  if summarise_flag | extract_flag then 
+    do;
+      run_dir = get_working_dir;
+      directory = '';
+      if verbose_flag then put skip list( 'INFO: working dir: <' || run_dir || '>' );
+      call process_dumpfile;
+    end;
+
+/* ------------------------------------------ */
+
+show_usage: proc;
+
+  put skip list( 'Usage: adfl [-hilsvVx] <dumpfile>' );
+  put skip list( 'Extract files &/or show contents of an AOS/VS (II) DUMP file on a GNU/Linux or Windows system.' );
+  put skip list( 'The current version can read (at least) versions 15 & 16 of the DUMP format.' );
+  put skip list( 'Options:' );
+  put skip list( ' h    show this help' );
+  put skip list( ' i    try to ignore errors eg. if a file cannot be created' );
+  put skip list( ' l    list the contents of the dump file' );
+  put skip list( ' s    concise summary of the dump file contents' );
+  put skip list( ' v    be verbose about what adfl is doing' );
+  put skip list( ' V    display the version number of adfl and exit' );
+  put skip list( ' x    extract files from the dump in the current directory' );
+
+  close file( sysprint );   /* flush */
+  exit;       	       	    /* exit */
+
+end show_usage;
+
+%PAGE;
+/***
+ * parse_parms
+ * 
+ * takes 1 input parameter - a string in the form "[-[A][B][C]] dumpfilename" 
+ * sets global flags if options are indicated
+ * returns dumpfilename (string at end of parms)
+ * error return: empty string
+ *
+ ***/
+parse_parms: proc( parms ) returns( char(132) varying );
+
+  dcl parms  char(132) varying;
+  dcl filename char(132) varying init( '' );
+
+  dcl opt_ix fixed bin;
+  dcl this_opt char init( '' );
+
+  /* any options? */
+  if substr( parms, 1, 1 ) = '-' then do;
+    opt_ix = 2;
+    do while( true );
+      this_opt = substr( parms, opt_ix, 1 );
+      if this_opt = ' ' then leave;
+      select( this_opt);
+        when( 'h' ) 
+	  do;
+	    call show_usage;
+	  end;
+	when( 'i' )	 ignore_errors_flag = true;
+	when( 'l', 's' ) summarise_flag    = true;
+	when( 'v' )      verbose_flag 	   = true;
+	when( 'V' )
+	  do;
+	    put skip list( 'adfl version ' || VERSION );
+	    close file( sysprint );
+	    exit;
+	  end;
+	when( 'x' )      extract_flag	   = true;
+	otherwise 
+	  do;
+	    call show_usage;
+	  end;
+      end; /* select */
+      opt_ix = opt_ix + 1;
+    end;
+  end;
+
+  if this_opt = ' ' then 
+    filename = substr( parms, opt_ix + 1 );
+  else
+    filename = parms;
+
+  return( filename );
+
+end parse_parms;	 
+
+%PAGE;
+/***
+ * read_header - read a block header from the dump file
+ *
+ *
+ ***/
+read_header: proc returns( bit );
+
+  dcl rword bit(16);
+
+  dcl rtype_6bit bit( 6 );
+  dcl rlen_10bit bit( 10 );
+
+  on error return( false );
+
+  read file( dumpfile ) into( rword ); 
+  rtype_6bit = substr( rword, 1, 6 );
+  RECORD_HEADER.record_type = rtype_6bit;
+  rlen_10bit = substr( rword, 7, 10 );
+  RECORD_HEADER.record_length = rlen_10bit;
+
+  return( true );
+
+end read_header;
+
+%PAGE;
+/***
+ * read_bs_word
+ *
+ *
+ * returns integer read from byte-swapped file
+ *
+ ***/
+read_bs_word: proc returns( fixed binary(15) );
+  
+  dcl revword bit(16);
+  dcl fdword fixed binary(15);
+
+  read file( dumpfile ) into( revword );
+  fdword = swap_bytes_in_word( revword );
+  
+  return( fdword ); 
+
+end read_bs_word;
+
+%PAGE;
+/***
+ * read_sod - load a Start Of Dump record from the dump file
+ * 
+ *
+ ***/
+read_sod: proc returns( pointer );
+
+  START_OF_DUMP = 0;
+  call read_header;
+
+  /* display( 'Record-type: ' || RECORD_HEADER.record_type || ' Length: ' || RECORD_HEADER.record_length ); */
+
+  START_OF_DUMP.sod_header = RECORD_HEADER;
+  if START_OF_DUMP.sod_header.record_type ^= START_DUMP_TYPE then do;
+    display( 'Error: This does not appear to be an AOS/VS dump file.' );
+    exit;
+  end;
+ 
+  START_OF_DUMP.dump_format_revision = read_bs_word;	
+  START_OF_DUMP.dump_time_secs 	     = read_bs_word;	
+  START_OF_DUMP.dump_time_mins	     = read_bs_word;	
+  START_OF_DUMP.dump_time_hours	     = read_bs_word;	
+  START_OF_DUMP.dump_time_day	     = read_bs_word;	
+  START_OF_DUMP.dump_time_month	     = read_bs_word;	
+  START_OF_DUMP.dump_time_year	     = read_bs_word;	
+
+end read_sod;
+
+%PAGE;
+/***
+ * make_symlink - invoke system call to create a symbolic link
+ *
+ * parm1 - existing file path
+ * parm2 - desired link path
+ *
+ ***/
+make_symlink: proc( oldpath, newpath );
+
+  dcl (oldpath, newpath) char(*) varying;
+
+  dcl (oldpath_nt, newpath_nt) char(512);
+  dcl RC fixed binary(31);
+
+  oldpath_nt = oldpath || '00'x;
+  newpath_nt = newpath || '00'x;
+
+  RC = syscall( SYS_SYMLINK, addr( oldpath_nt ), addr( newpath_nt ) );
+
+  if RC ^= 0 then 
+    do;
+      display( 'Error: could not create symbolic link from ' || oldpath || 
+      	       ' to ' || newpath || 
+	       ' ErrNum: ' || RC );
+      if ^ignore_errors_flag then 
+        do;
+          display( 'Giving up.' );
+	  exit;
+        end;
+    end;
+
+end make_symlink;
+
+%PAGE;
+/***
+ *
+ * process_dir - handle/create directory as required
+ *
+ ***/
+process_dir: proc;
+
+  file_type = 'Directory';
+  if length( directory ) > 0 then directory = directory || '/';
+  directory = directory || file_name; 
+  
+  if extract_flag & length( file_name ) > 0 then do;
+    /* make the directory */
+    dcl RC fixed binary(31);
+    dcl tmp_dname char(512) varying;
+    tmp_dname = file_name;
+    dcl tmp_zdname char(512);
+
+    if verbose_flag then put skip list( 'Creating directory <' || tmp_dname || '>' );
+
+    tmp_zdname = tmp_dname || '00'x; /* make null-terminated */
+    RC = syscall( SYS_MKDIR, addr( tmp_zdname ), 511 );
+    
+    if RC ^= 0 then do;
+      display( 'Error: could not create directory <'|| tmp_dname || '> ErrNum: ' || RC );
+      if ^ignore_errors_flag then do;
+      	 display( 'Giving up.' );
+	 exit;
+      end;
+    end;
+
+    if length( file_name ) > 0 then do;
+      if verbose_flag then put skip list( 'INFO: Chdir into <' || tmp_dname || '>' );
+      dcl cdir char(512);
+      cdir = tmp_dname || '00'x;
+      RC = syscall( SYS_CHDIR, addr( cdir ) );
+    
+      if RC ^= 0 then do;
+        display( 'Error: could not change into directory <' ||  tmp_dname || '>' );
+        if ^ignore_errors_flag then do;
+          display( 'Giving up.' );
+  	  exit;
+        end;
+      end;
+    end;
+
+  end;
+
+  file_name = '';
+  load_it = false;
+end process_dir;
+
+%PAGE;
+/***
+ *
+ * process_name_block - handle a block of file names
+ *
+ ***/
+process_name_block: proc;
+
+  dcl file_name_sz fixed binary(31);
+  dcl file_name_ctl char(file_name_sz) ctl; 
+
+  NAME_BLOCK.file_name = ''; 
+  file_name_sz = RECORD_HEADER.record_length;
+  allocate file_name_ctl; 
+  read file( dumpfile ) into( file_name_ctl ); 
+  file_name = substr( file_name_ctl, 1, file_name_sz ); /* can't just copy - poss. bug in ispli */
+  free file_name_ctl;
+  NAME_BLOCK.file_name = file_name;
+
+  if summarise_flag & verbose_flag then put skip;
+
+  select( FILE_STATUS_BLOCK.fstat.entry_type );
+    when( FLNK ) do;
+        file_type = 'Link';
+	load_it = false;
+      end;
+    when( FDIR ) call process_dir;
+    when( FSTF ) do;
+        file_type = 'Symbol table';
+	load_it = true;
+      end;
+    when( FTXT ) do;
+    	file_type = 'Text file'; 
+	load_it = true;
+      end;
+    when( FPRG, FPRV ) do;
+        file_type = 'Program file';
+	load_it = true;
+      end;  	   
+    otherwise do;
+        /* we don't explicitly recognise the file type */ /* TODO: get definitive list from paru.32.sr */
+        file_type = 'File';
+	load_it = true;
+      end;
+  end; /* select */
+
+  if summarise_flag then do;
+    if length( directory ) = 0 then
+      put skip edit( file_type, '    ', file_name ) ( a(15),a, a );
+    else
+      put skip edit( file_type, '    ', directory, '/', file_name ) ( a(15), a, a, a, a );
+
+    if verbose_flag & (FILE_STATUS_BLOCK.fstat.entry_type = FDIR) then 
+      put skip;
+    else
+      put list( '        ' );
+  end;
+
+  /* create/open the file */
+
+  /* TODO: Error handling here... */
+  if extract_flag & load_it then do;
+     if verbose_flag then put skip list( 'INFO: Attempting to create file: ' || file_name );       
+     open file( loadedfp ) title( file_name );
+  end;
+
+end process_name_block;
+
+%PAGE;
+/***
+ * process_link - create a file link
+ *
+ *
+ ***/
+process_link: proc;
+
+  dcl lrn_sz fixed binary(31);
+  dcl lrn_ctl char(lrn_sz) ctl;
+  
+  LINK_BLOCK.link_resolution_name = '';
+  lrn_sz = RECORD_HEADER.record_length;
+  allocate lrn_ctl;
+  read file( dumpfile ) into ( lrn_ctl );
+  LINK_BLOCK.link_resolution_name = substr( lrn_ctl, 1, lrn_sz ); /* workaround */
+  free lrn_ctl;
+
+  /* convert AOS/VS-style directory separators to Unix slashes and UPPER case it */
+  dcl tmp_ln char(512) varying;
+  tmp_ln = translate( LINK_BLOCK.link_resolution_name, 
+  	   	      '/ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+		      ':abcdefghijklmnopqrstuvwxyz' );
+  LINK_BLOCK.link_resolution_name = tmp_ln;
+  
+  if summarise_flag then do;
+    put skip list( ' -> Link Target: ' || LINK_BLOCK.link_resolution_name  );
+  end;
+
+  if extract_flag then do;
+    call make_symlink( LINK_BLOCK.link_resolution_name, file_name );
+  end;
+
+end process_link;
+
+%PAGE;
+/***
+ * process_data_block - get the actual data from the dump file
+ *
+ *
+ ***/
+process_data_block:  proc;
+
+  dcl (rev_bytes_addr, rev_bytes_len) bit(32);
+  dcl rev_bytes_aln bit(16);
+
+  dcl data_size fixed binary(31);
+  dcl data_area char( data_size ) ctl;
+  dcl padding_size fixed binary(31);
+  dcl padding_area char(512) init( (512)'00'X );
+  dcl padding_blocks fixed binary(31);
+
+  dcl achar char;
+  dcl i fixed binary(15);
+
+  /* for the summary - we only care about the length */
+  read file( dumpfile ) into( rev_bytes_addr );
+  DATA_HEADER_BLOCK.byte_address = rev_bytes_in_dword( rev_bytes_addr );
+  read file( dumpfile ) into( rev_bytes_len );
+  DATA_HEADER_BLOCK.byte_length = rev_bytes_in_dword( rev_bytes_len );
+
+  if DATA_HEADER_BLOCK.byte_length > MAX_BLOCK_SIZE then do;
+    display( 'Error: Maximum supported block size exceeded ( '|| MAX_BLOCK_SIZE || ' vs. ' || DATA_HEADER_BLOCK.byte_length );
+    display( 'Aborting' );
+    exit;
+  end;
+
+ 
+  read file( dumpfile ) into( rev_bytes_aln );
+  DATA_HEADER_BLOCK.alignment_count = swap_bytes_in_word( rev_bytes_aln );
+
+  if summarise_flag & verbose_flag then do;
+    put skip edit( ' Data block: ', DATA_HEADER_BLOCK.byte_length, ' bytes' ) ( a, f(10), a );
+  end;
+
+  /* skip alignment bytes - usualy just one byte */
+  if DATA_HEADER_BLOCK.alignment_count > 0 then
+    do i = 1 to DATA_HEADER_BLOCK.alignment_count;
+      read file( dumpfile ) into ( achar );
+    end;
+
+  /* single read into controlled variable */
+  data_size = DATA_HEADER_BLOCK.byte_length;
+  allocate data_area; 
+  read file( dumpfile ) into( data_area );
+
+  if extract_flag then do;
+    /* pad out if block address is beyond end of last block */
+    if DATA_HEADER_BLOCK.byte_address > ( total_file_byte_size + 1 ) then do;
+       padding_size = DATA_HEADER_BLOCK.byte_address - total_file_byte_size;
+       padding_blocks = padding_size / 512;
+display( 'DEBUG: Padding by ' || padding_size || ' bytes (' || padding_blocks || ' blocks) from ' || total_file_byte_size || ' to address ' || DATA_HEADER_BLOCK.byte_address );
+       do i = 1 to padding_blocks;
+       	  write file( loadedfp ) from ( padding_area );
+       	  total_file_byte_size = total_file_byte_size + 512;
+       end;
+    end;
+
+    write file( loadedfp ) from ( data_area ); 
+    total_file_byte_size = total_file_byte_size + data_size;
+  end;
+
+  free data_area;
+
+  /* total_file_byte_size = total_file_byte_size + DATA_HEADER_BLOCK.byte_length; */
+  accum_total_file_size = true;
+  in_file_blocks = true;
+  
+end process_data_block;
+
+%PAGE;
+/***
+ * process_end_block - end of file or directory in dump so tidy up 
+ *
+ ***/
+process_end_block: proc;
+
+  dcl slash_pos fixed bin;
+  dcl RC fixed binary(31);
+
+  if in_file_blocks then do;
+      if extract_flag & load_it then do;
+       	   close file(loadedfp);
+           /* if verbose_flag then put skip list( ' Closed file' ); */
+        end;
+      else do;
+       	   if verbose_flag then put skip list( ' End of this file' );
+	end;
+      if accum_total_file_size & summarise_flag then 
+      	 put edit( total_file_byte_size, ' bytes' ) ( f(10), a );
+      /* reset some flags and accumulators */
+      total_file_byte_size = 0;
+      accum_total_file_size = false;
+      in_file_blocks = false;
+    end;
+  else do;
+       /* not in the middle of file, this is a directory pop instruction */
+       if length( directory ) > 0 then do;
+	 slash_pos = length( directory );
+         do while( (slash_pos > 1) & (substr( directory, slash_pos, 1 ) ^= '/') );
+	   slash_pos = slash_pos - 1;
+         end;
+         directory = substr( directory, 1, slash_pos - 1 );
+
+         if extract_flag then do;
+	   dcl cdir char(512);
+      	   cdir = run_dir || '/' || directory || '00'x;
+    	 
+	   RC = syscall( SYS_CHDIR, addr( cdir ) );
+    	   if verbose_flag then put skip list( 'INFO: Attempting to chdir back to <' || directory || '>' );
+	   if RC ^= 0 then do;
+             display( 'Error: could not change back into directory <' || directory || '>' );
+      	     if ^ignore_errors_flag then do;
+               display( 'Giving up.' );
+	       exit;
+             end;
+    	   end;
+	 end;
+
+       end;
+    end;
+end process_end_block;
+
+%PAGE;
+/***
+ * process_acl - handle Access Control List
+ *
+ *
+ ***/
+process_acl: proc;
+
+  dcl acl_sz fixed binary(31);
+  dcl acl_ctl char(acl_sz) ctl;
+
+  ACL_BLOCK.acl = '';
+  acl_sz = RECORD_HEADER.record_length;
+  allocate acl_ctl;
+  read file( dumpfile ) into( acl_ctl );
+  ACL_BLOCK.acl = substr( acl_ctl, 1, acl_sz ); /* workaround */
+
+  if verbose_flag then do;
+    put skip list( ' ACL: ', ACL_BLOCK.acl, ' Length: ', RECORD_HEADER.record_length );
+  end;
+
+
+end process_acl;
+
+%PAGE;
+/***
+ * process_dumpfile
+ *
+ * open the specified dump file and work through each block to the end
+ ***/
+process_dumpfile: proc;
+
+  on UNDEFINEDFILE(dumpfile) do;
+    display( 'Error: could not find dump file ' || dump_filename );
+    close file( sysprint );
+    exit;
+  end;
+
+  open file( dumpfile ) title( dump_filename );
+
+  /* there should always be a SOD record... */
+  call read_sod;
+  if summarise_flag then do;
+    put skip edit( 'AOS/VS DUMP format version: ', START_OF_DUMP.dump_format_revision ) (a, f(2));
+    put skip edit( 'Dump date (yy-mm-dd) : ',  
+    	     	   START_OF_DUMP.dump_time_year, '-',
+		   START_OF_DUMP.dump_time_month, '-',
+		   START_OF_DUMP.dump_time_day )
+		 ( a, p'99', a, p'99', a, p'99' );
+    put skip edit( 'Dump time (hh:mm:ss) : ',  
+    	     	   START_OF_DUMP.dump_time_hours, ':',
+		   START_OF_DUMP.dump_time_mins, ':',
+		   START_OF_DUMP.dump_time_secs )
+		 ( a, p'99', a, p'99', a, p'99' );
+  end;
+
+  /* now go through the dump examining each block type and acting accordingly... */
+
+  dcl more bit init( true );
+
+  do while( more );
+
+    call read_header;
+
+    select( RECORD_HEADER.record_type );
+      when( FSB_TYPE ) do;
+	  /* load but do not process for now - I think we will only need it if we plan to handle 'sparse' file dumps */
+	  read file( dumpfile ) into( FILE_STATUS_BLOCK.fstat );
+	  load_it = false;
+	end;
+      when( NB_TYPE )	call process_name_block;
+      when( UDA_TYPE ) do;
+      	  /* load but ignore for now */
+ 	  read file( dumpfile ) into ( UDA_BLOCK.uda );
+        end; 
+      when( ACL_TYPE )	       call process_acl;
+      when( LINK_TYPE )	       call process_link;
+      when( START_BLOCK_TYPE ) ; /* nothing to do - it's just a record header */
+      when( DATA_BLOCK_TYPE )  call process_data_block;
+      when( END_BLOCK_TYPE )   call process_end_block;
+      when( END_DUMP_TYPE ) do;
+          put skip list( '=== End of Dump ===' );
+	  more = false;
+	end;
+      otherwise do;
+      	  display( 'Error: Unknown block type (' || RECORD_HEADER.record_type || ') in dump file.  Giving up.' );
+	  more = false;
+        end;
+    end; /* select */
+
+  end;
+
+  close file( dumpfile );
+
+end process_dumpfile;
+
+
+end adfl;
+

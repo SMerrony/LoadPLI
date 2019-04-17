@@ -1,0 +1,23 @@
+get_working_dir: proc returns( char(500) varying );
+
+  dcl osgetenv entry( ptr ) returns( ptr ) options( linkage( system ) ) ext( '_pli_OSGetEnv' );
+  dcl (p, q) ptr;
+  dcl returnedVal char( 500 ) based( p );
+  dcl result char(500) varying;
+  dcl EnvVarName char(8);
+  dcl c fixed binary;
+
+  dcl (addr, index, substr) builtin;
+
+  EnvVarName = 'PWD' || '00'x;
+  q = addr( EnvVarName );
+
+  p = osgetenv( q );
+
+  c = index( returnedVal, '00'x );
+  
+  result = substr( returnedVal, 1, c - 1 );
+
+  return( result );
+
+end get_working_dir;

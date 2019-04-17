@@ -1,0 +1,33 @@
+rev_bytes_in_dword: proc ( unswapped ) returns( fixed bin(31) );
+
+  dcl unswapped bit(32);
+
+  dcl 1 rdword union,
+        3 bsdword bit(32),
+	3 bytes,
+       	  5 byte_d  bit(8),
+	  5 byte_c  bit(8),
+	  5 byte_b  bit(8),
+	  5 byte_a  bit(8);
+ 
+  dcl 1 fdword union,
+      	3 fwdword fixed bin(31),
+	3 bytes,
+	  5 byte_a  bit(8),
+	  5 byte_b  bit(8),
+	  5 byte_c  bit(8),
+	  5 byte_d  bit(8);
+
+  rdword.bsdword = unswapped;
+  fdword.bytes.byte_a = rdword.bytes.byte_a;
+  fdword.bytes.byte_b = rdword.bytes.byte_b;
+  fdword.bytes.byte_c = rdword.bytes.byte_c;
+  fdword.bytes.byte_d = rdword.bytes.byte_d;
+
+  /* put skip edit( 'DEBUG: rev_bytes_in_dword - Got: ', unswapped, ' Returning: ', fdword.fwdword )
+    	     ( a, b, a, f(10) ); */
+
+  return( fdword.fwdword );
+
+end rev_bytes_in_dword;
+

@@ -1,0 +1,1 @@
+declare rev_bytes_in_dword external entry( bit(32) ) returns( fixed binary(31) );

@@ -1,0 +1,24 @@
+swap_bytes_in_word: proc ( unswapped ) returns( fixed binary(15) );
+
+  dcl unswapped bit(16);
+
+  dcl 1 rword union,
+        3 bsword bit(16),
+	3 bytes,
+	  5 byte_b  bit(8),
+	  5 byte_a  bit(8);
+ 
+  dcl 1 fword union,
+      	3 fwdword fixed binary(15),
+	3 bytes,
+	  5 byte_a  bit(8),
+	  5 byte_b  bit(8);
+
+  rword.bsword = unswapped;
+  fword.bytes.byte_a = rword.bytes.byte_a;
+  fword.bytes.byte_b = rword.bytes.byte_b;
+
+  return( fword.fwdword );
+
+end swap_bytes_in_word;
+
